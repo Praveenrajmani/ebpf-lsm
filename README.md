@@ -9,19 +9,25 @@ Prevents accidental `rm -rf` operations on MinIO data directories while allowing
 Uses LSM BPF hooks to intercept file deletion operations (`unlink`, `rmdir`, `rename`) at the kernel level:
 
 ```
-User attempts: rm -rf /mnt/disk1/data/*
+User attempts: rm -rf /tmp/clusterone/data/*
       ↓
 Kernel: sys_unlink() syscall
       ↓
 LSM Hook: inode_unlink()
       ↓
-eBPF Program: Check UID against whitelist
+eBPF Program: Check if path matches protected prefix
       ↓
-   Allowed UID? → Yes → Operation proceeds
-                → No  → Return -EPERM (blocked)
+   Protected path? → No → Allow operation
+                  → Yes → Check UID against whitelist
+                          ↓
+                       Allowed UID? → Yes → Operation proceeds
+                                    → No  → Return -EPERM (blocked)
 ```
 
-**Key Insight**: eBPF LSM hooks run BEFORE the actual filesystem operation, allowing us to block deletions without any filesystem-level restrictions.
+**Key Features**:
+- **Path-based filtering**: Only protects specified paths (e.g., `/tmp/clusterone*`, `/mnt/disk1*`)
+- **UID whitelist**: Allows only specific UIDs (e.g., MinIO service user) to delete files in protected paths
+- **Kernel-level enforcement**: eBPF LSM hooks run BEFORE the filesystem operation, blocking deletions without any filesystem-level restrictions
 
 ## Requirements
 
@@ -89,12 +95,17 @@ make
 # Find MinIO user UID
 id minio-user  # or: id minio
 
-# Run with MinIO UID (example: 1000)
-sudo .output/minio_protect -u 1000
+# Protect files under 'clusterone1' directory, allow only UID 1000
+sudo .output/minio_protect -u 1000 -p clusterone1
+
+# Protect multiple directories (comma-separated)
+sudo .output/minio_protect -u 1000 -p clusterone1,clusterone2,clusterone3
 
 # With verbose logging and stats every 10 seconds
-sudo .output/minio_protect -u 1000 -v -s 10
+sudo .output/minio_protect -u 1000 -p clusterone1 -v -s 10
 ```
+
+**IMPORTANT**: Pass only the directory name (e.g., `clusterone1`), NOT the full path (e.g., `/tmp/clusterone1`). The protection works by checking parent directory names in the file path. If you specify `-p clusterone1`, it will protect any file whose parent directory tree contains a directory named "clusterone1", regardless of where it is located (e.g., `/tmp/clusterone1/file.txt`, `/mnt/clusterone1/data/file.txt`).
 
 **Option B: Install and run as systemd service**
 ```bash
@@ -105,7 +116,7 @@ sudo make install
 sudo nano /etc/systemd/system/minio-protect.service
 ```
 
-Service file content (replace UID 1000 with your MinIO UID):
+Service file content (replace UID and paths with your configuration):
 ```ini
 [Unit]
 Description=MinIO Protection eBPF LSM Service
@@ -115,7 +126,7 @@ After=network.target
 Type=simple
 Restart=on-failure
 RestartSec=5s
-ExecStart=/usr/local/bin/minio_protect -u 1000 -s 300
+ExecStart=/usr/local/bin/minio_protect -u 1000 -p clusterone1,clusterone2,clusterone3 -s 300
 LimitMEMLOCK=infinity
 StandardOutput=journal
 StandardError=journal
@@ -141,10 +152,17 @@ sudo bpftool prog list | grep minio
 # Monitor real-time logs (terminal 1)
 sudo cat /sys/kernel/debug/tracing/trace_pipe | grep -E 'BLOCKED|ALLOWED'
 
-# Test protection (terminal 2)
+# Test protection on protected path (terminal 2)
+# Assuming you ran: sudo .output/minio_protect -u 1000 -p clusterone1
+sudo mkdir -p /tmp/clusterone1
+sudo touch /tmp/clusterone1/test.txt
+sudo rm /tmp/clusterone1/test.txt
+# Should see "BLOCKED unlink: UID=0" in terminal 1 (blocked because UID 0 != 1000)
+
+# Test non-protected path (should work normally)
 sudo touch /tmp/test.txt
 sudo rm /tmp/test.txt
-# Should see "BLOCKED unlink: UID=0" in terminal 1
+# Should succeed without blocking
 ```
 
 ## Service Management

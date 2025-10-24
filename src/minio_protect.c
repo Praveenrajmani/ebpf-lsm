@@ -27,12 +27,16 @@
 #include "minio_protect.skel.h"
 
 #define MAX_ALLOWED_UIDS 32
+#define MAX_PROTECTED_PATHS 16
+#define MAX_PATH_LEN 256
 
 static volatile bool exiting = false;
 
 struct config {
 	unsigned int allowed_uids[MAX_ALLOWED_UIDS];
 	unsigned int num_uids;
+	char protected_paths[MAX_PROTECTED_PATHS][MAX_PATH_LEN];
+	unsigned int num_paths;
 	bool protection_enabled;
 	bool verbose;
 	unsigned int stats_interval;
@@ -49,34 +53,86 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
 	return vfprintf(stderr, format, args);
 }
 
+/* Parse comma-separated paths */
+static int parse_comma_separated_paths(const char *paths_str, struct config *cfg)
+{
+	char *paths_copy = strdup(paths_str);
+	if (!paths_copy) {
+		fprintf(stderr, "Out of memory\n");
+		return -1;
+	}
+
+	char *token = strtok(paths_copy, ",");
+	while (token != NULL) {
+		/* Trim whitespace */
+		while (*token == ' ' || *token == '\t')
+			token++;
+
+		char *end = token + strlen(token) - 1;
+		while (end > token && (*end == ' ' || *end == '\t'))
+			*end-- = '\0';
+
+		if (strlen(token) == 0) {
+			token = strtok(NULL, ",");
+			continue;
+		}
+
+		if (cfg->num_paths >= MAX_PROTECTED_PATHS) {
+			fprintf(stderr, "Too many paths (max %d)\n", MAX_PROTECTED_PATHS);
+			free(paths_copy);
+			return -1;
+		}
+
+		if (strlen(token) >= MAX_PATH_LEN) {
+			fprintf(stderr, "Path too long (max %d): %s\n",
+				MAX_PATH_LEN - 1, token);
+			free(paths_copy);
+			return -1;
+		}
+
+		strncpy(cfg->protected_paths[cfg->num_paths++], token, MAX_PATH_LEN - 1);
+		printf("Added protected path: %s\n", token);
+
+		token = strtok(NULL, ",");
+	}
+
+	free(paths_copy);
+	return 0;
+}
+
 static void print_usage(const char *prog)
 {
 	fprintf(stderr,
 		"MinIO Protection - eBPF LSM-based deletion protection\n\n"
 		"Usage: %s [options]\n\n"
 		"Options:\n"
-		"  -u, --uid UID         Add UID to allowed list (can be repeated)\n"
-		"  -d, --disable         Start with protection disabled (use for testing)\n"
-		"  -v, --verbose         Enable verbose logging (log allowed ops too)\n"
-		"  -s, --stats SECONDS   Print statistics every N seconds (default: 60)\n"
-		"  -h, --help            Show this help message\n\n"
+		"  -u, --uid UID            Add UID to allowed list (can be repeated)\n"
+		"  -p, --paths PATH1,PATH2  Comma-separated list of directory names to protect\n"
+		"                           Examples: clusterone1,clusterone2,clusterone3\n"
+		"  -d, --disable            Start with protection disabled (use for testing)\n"
+		"  -v, --verbose            Enable verbose logging (log allowed ops too)\n"
+		"  -s, --stats SECONDS      Print statistics every N seconds (default: 60)\n"
+		"  -h, --help               Show this help message\n\n"
 		"Examples:\n"
-		"  # Allow only UID 1000 (minio user) to delete files\n"
-		"  %s -u 1000\n\n"
+		"  # Protect files under 'clusterone1' directory, allow only UID 1000\n"
+		"  %s -u 1000 -p clusterone1\n\n"
+		"  # Protect multiple directories (comma-separated)\n"
+		"  %s -u 1000 -p clusterone1,clusterone2,clusterone3\n\n"
 		"  # Allow multiple UIDs\n"
-		"  %s -u 1000 -u 0\n\n"
+		"  %s -u 1000 -u 0 -p clusterone1\n\n"
 		"  # Start disabled for testing, print stats every 10 seconds\n"
-		"  %s -u 1000 -d -s 10\n\n"
+		"  %s -u 1000 -p clusterone1 -d -s 10\n\n"
 		"Note: Protection can be enabled/disabled at runtime using:\n"
 		"  echo 1 > /sys/fs/bpf/minio_protect_config/enable  (enable)\n"
 		"  echo 0 > /sys/fs/bpf/minio_protect_config/enable  (disable)\n",
-		prog, prog, prog, prog);
+		prog, prog, prog, prog, prog);
 }
 
 static int parse_args(int argc, char **argv, struct config *cfg)
 {
 	static struct option long_options[] = {
 		{ "uid", required_argument, 0, 'u' },
+		{ "path", required_argument, 0, 'p' },
 		{ "disable", no_argument, 0, 'd' },
 		{ "verbose", no_argument, 0, 'v' },
 		{ "stats", required_argument, 0, 's' },
@@ -88,11 +144,12 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 
 	/* Defaults */
 	cfg->num_uids = 0;
+	cfg->num_paths = 0;
 	cfg->protection_enabled = true;
 	cfg->verbose = false;
 	cfg->stats_interval = 60;
 
-	while ((opt = getopt_long(argc, argv, "u:dvs:h", long_options,
+	while ((opt = getopt_long(argc, argv, "u:p:dvs:h", long_options,
 				  NULL)) != -1) {
 		switch (opt) {
 		case 'u':
@@ -107,6 +164,12 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 				return -1;
 			}
 			cfg->allowed_uids[cfg->num_uids++] = uid;
+			break;
+		case 'p':
+			/* Parse comma-separated paths */
+			if (parse_comma_separated_paths(optarg, cfg) != 0) {
+				return -1;
+			}
 			break;
 		case 'd':
 			cfg->protection_enabled = false;
@@ -138,6 +201,13 @@ static int parse_args(int argc, char **argv, struct config *cfg)
 		return -1;
 	}
 
+	if (cfg->num_paths == 0) {
+		fprintf(stderr,
+			"Error: At least one protected path required (-p)\n\n");
+		print_usage(argv[0]);
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -159,6 +229,21 @@ static int configure_maps(struct minio_protect_bpf *skel, struct config *cfg)
 			return err;
 		}
 		printf("Added UID %u to allowed list\n", uid);
+	}
+
+	/* Add protected path prefixes */
+	int paths_fd = bpf_map__fd(skel->maps.protected_paths);
+	for (unsigned int i = 0; i < cfg->num_paths; i++) {
+		__u32 key = i;
+		char path[MAX_PATH_LEN] = {};
+		strncpy(path, cfg->protected_paths[i], MAX_PATH_LEN - 1);
+		err = bpf_map_update_elem(paths_fd, &key, path, BPF_ANY);
+		if (err) {
+			fprintf(stderr, "Failed to add protected path '%s': %d\n",
+				cfg->protected_paths[i], err);
+			return err;
+		}
+		printf("Added protected path: %s\n", cfg->protected_paths[i]);
 	}
 
 	/* Configure protection enabled/disabled */
@@ -285,7 +370,11 @@ int main(int argc, char **argv)
 		printf("%u%s", cfg.allowed_uids[i],
 		       i < cfg.num_uids - 1 ? ", " : "");
 	}
-	printf("\nVerbose logging: %s\n", cfg.verbose ? "ON" : "OFF");
+	printf("\nProtected paths:\n");
+	for (unsigned int i = 0; i < cfg.num_paths; i++) {
+		printf("  - %s\n", cfg.protected_paths[i]);
+	}
+	printf("Verbose logging: %s\n", cfg.verbose ? "ON" : "OFF");
 	printf("Stats interval: %u seconds\n", cfg.stats_interval);
 	printf("\nBlocking unlink, rmdir, and rename operations from non-allowed users.\n");
 	printf("Press Ctrl-C to exit and disable protection.\n\n");

@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(systemctl status:*)",
+      "Read(//sys/kernel/security/**)",
+      "Read(//sys/kernel/btf/**)",
+      "Bash(make)",
+      "Bash(make clean:*)",
+      "Bash(make check-kernel:*)",
+      "Bash(systemctl cat:*)",
+      "Read(//tmp/**)",
+      "Bash(sudo lsof:*)",
+      "Bash(mc admin info:*)",
+      "Read(//etc/minio/**)",
+      "Bash(sudo find:*)",
+      "Bash(sudo journalctl:*)",
+      "Read(//etc/systemd/system/**)",
+      "Bash(awk:*)",
+      "Bash(chmod:*)",
+      "Bash(yes:*)",
+      "Bash(rm:*)",
+      "Bash(echo:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

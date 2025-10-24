@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /* MinIO Protection eBPF LSM Program
  *
- * This program uses LSM (Linux Security Module) BPF hooks to prevent
- * file deletions from unauthorized users while allowing MinIO to operate normally.
+ * SIMPLIFIED VERSION: Checks parent directory names instead of full path
+ * This avoids complex path reconstruction and verifier issues.
  *
- * Features:
- * - Blocks unlink/rmdir/rename operations from non-allowed UIDs
- * - Maintains whitelist of allowed UIDs (e.g., minio user)
- * - Tracks statistics (blocked/allowed operations)
- * - Real-time logging of blocked attempts
- *
- * Requirements:
- * - Kernel 5.7+ with CONFIG_BPF_LSM=y
- * - BTF enabled (CONFIG_DEBUG_INFO_BTF=y)
- * - lsm=bpf in kernel command line
+ * For path /tmp/clusterone1/.minio.sys/file.txt:
+ * - We check if any parent directory matches protected prefix
+ * - More practical for eBPF verifier limitations
  */
 
 #include <vmlinux.h>
@@ -22,12 +15,11 @@
 #include <bpf/bpf_core_read.h>
 
 #define MAX_ALLOWED_UIDS 32
+#define MAX_PROTECTED_PATHS 16
+#define MAX_PATH_LEN 256
 #define EPERM 1  /* Operation not permitted */
 
-/* Map: Allowed UIDs that can perform deletion operations
- * Key: UID (u32)
- * Value: 1 if allowed, 0 otherwise
- */
+/* Map: Allowed UIDs that can perform deletion operations */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_ALLOWED_UIDS);
@@ -35,10 +27,15 @@ struct {
 	__type(value, __u8);
 } allowed_uids SEC(".maps");
 
-/* Map: Per-UID statistics
- * Key: UID (u32)
- * Value: Number of blocked attempts
- */
+/* Map: Protected path prefixes */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_PROTECTED_PATHS);
+	__type(key, __u32);
+	__type(value, char[MAX_PATH_LEN]);
+} protected_paths SEC(".maps");
+
+/* Map: Per-UID statistics */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -46,10 +43,7 @@ struct {
 	__type(value, __u64);
 } blocked_stats SEC(".maps");
 
-/* Map: Global statistics
- * Index 0: Total blocked count
- * Index 1: Total allowed count
- */
+/* Map: Global statistics */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 2);
@@ -62,10 +56,7 @@ enum {
 	STAT_ALLOWED_TOTAL = 1,
 };
 
-/* Map: Configuration flags
- * Index 0: enable_protection (1 = active, 0 = disabled)
- * Index 1: log_allowed (1 = log allowed ops, 0 = only log blocked)
- */
+/* Map: Configuration flags */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 2);
@@ -94,6 +85,79 @@ static __always_inline bool should_log_allowed(void)
 	return log && *log == 1;
 }
 
+/* Simple string comparison for path prefixes (up to 32 chars to avoid verifier issues) */
+static __always_inline bool path_starts_with(const char *name, const char *prefix)
+{
+	#pragma unroll
+	for (int i = 0; i < 32; i++) {
+		if (prefix[i] == '\0')
+			return true;  /* Reached end of prefix, it's a match */
+		if (name[i] == '\0')
+			return false; /* Name ended before prefix */
+		if (name[i] != prefix[i])
+			return false; /* Mismatch */
+	}
+	return true; /* All 32 chars matched */
+}
+
+/* Check if dentry or any parent matches protected path
+ * We walk up parent directories checking each one */
+static __always_inline bool is_protected_path(struct dentry *dentry)
+{
+	struct dentry *current = dentry;
+	struct dentry *parent;
+	struct qstr d_name;
+	char name_buf[32];  /* Reduced to 32 to match string comparison limit */
+
+	/* Walk up to 4 levels checking each directory name (reduced from 6) */
+	#pragma unroll
+	for (int level = 0; level < 4; level++) {
+		if (!current)
+			break;
+
+		/* Read dentry name */
+		int err = bpf_probe_read_kernel(&d_name, sizeof(d_name), &current->d_name);
+		if (err)
+			break;
+
+		/* Copy name to buffer */
+		err = bpf_probe_read_kernel_str(name_buf, sizeof(name_buf), d_name.name);
+		if (err < 0)
+			break;
+
+		/* Debug: print the directory name we're checking */
+		bpf_printk("Checking dir level %d: %s\n", level, name_buf);
+
+		/* Check this directory name against all protected prefixes (reduced from 16 to 8) */
+		#pragma unroll
+		for (int i = 0; i < 8; i++) {
+			__u32 idx = i;
+			char *prefix = bpf_map_lookup_elem(&protected_paths, &idx);
+			if (!prefix || prefix[0] == '\0')
+				break;
+
+			/* Debug: print what we're comparing */
+			bpf_printk("Comparing '%s' with prefix '%s'\n", name_buf, prefix);
+
+			/* Check if name starts with prefix */
+			if (path_starts_with(name_buf, prefix)) {
+				bpf_printk("MATCH FOUND!\n");
+				return true;
+			}
+		}
+
+		/* Move to parent */
+		err = bpf_probe_read_kernel(&parent, sizeof(parent), &current->d_parent);
+		if (err || parent == current)
+			break;
+
+		current = parent;
+	}
+
+	bpf_printk("No match found\n");
+	return false;
+}
+
 /* Update global statistics */
 static __always_inline void update_global_stat(__u32 stat_type)
 {
@@ -115,11 +179,17 @@ static __always_inline void update_blocked_stat(__u32 uid)
 }
 
 /* Core deletion check logic */
-static __always_inline int check_deletion_allowed(const char *op_name)
+static __always_inline int check_deletion_allowed(const char *op_name, struct dentry *dentry)
 {
 	/* If protection is disabled, allow everything */
 	if (!is_protection_enabled())
 		return 0;
+
+	/* Check if this path is protected */
+	if (!is_protected_path(dentry)) {
+		/* Not a protected path, allow operation */
+		return 0;
+	}
 
 	__u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
 
@@ -152,49 +222,38 @@ static __always_inline int check_deletion_allowed(const char *op_name)
 	return -EPERM; /* Permission denied */
 }
 
-/* LSM Hook: inode_unlink
- * Called when a file is about to be unlinked
- */
+/* LSM Hook: inode_unlink */
 SEC("lsm/inode_unlink")
 int BPF_PROG(minio_protect_unlink, struct inode *dir, struct dentry *dentry,
 	     int ret)
 {
-	/* If previous LSM already denied, respect that */
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("unlink");
+	return check_deletion_allowed("unlink", dentry);
 }
 
-/* LSM Hook: inode_rmdir
- * Called when a directory is about to be removed
- */
+/* LSM Hook: inode_rmdir */
 SEC("lsm/inode_rmdir")
 int BPF_PROG(minio_protect_rmdir, struct inode *dir, struct dentry *dentry,
 	     int ret)
 {
-	/* If previous LSM already denied, respect that */
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("rmdir");
+	return check_deletion_allowed("rmdir", dentry);
 }
 
-/* LSM Hook: inode_rename
- * Called when a file/directory is about to be renamed
- * This is important because rename can effectively delete files
- * (when renaming over an existing file)
- */
+/* LSM Hook: inode_rename */
 SEC("lsm/inode_rename")
 int BPF_PROG(minio_protect_rename, struct inode *old_dir,
 	     struct dentry *old_dentry, struct inode *new_dir,
 	     struct dentry *new_dentry, int ret)
 {
-	/* If previous LSM already denied, respect that */
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("rename");
+	return check_deletion_allowed("rename", old_dentry);
 }
 
 char LICENSE[] SEC("license") = "GPL";
