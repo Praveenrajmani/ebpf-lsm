@@ -1,0 +1,32 @@
+# Build output
+.output/
+*.o
+*.a
+*.so
+*.skel.h
+
+# Generated binaries
+minio_protect
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+*.d
+.depend
+
+# Temporary files
+*.tmp
+*.bak
+
+# Core dumps
+core
+core.*
+
+# Generated skeleton headers
+src/*.skel.h

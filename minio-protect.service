@@ -1,0 +1,36 @@
+[Unit]
+Description=MinIO Protection eBPF LSM Service
+Documentation=https://github.com/miniohq/ebpf-lsm
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+
+# Run as root (required for eBPF)
+User=root
+Group=root
+
+# Binary location
+ExecStart=/usr/local/bin/minio_protect -u 1000 -s 300
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/sys/fs/bpf
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=minio-protect
+
+[Install]
+WantedBy=multi-user.target
