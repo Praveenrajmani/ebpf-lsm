@@ -227,6 +227,27 @@ sudo rm /usr/local/bin/minio_protect
 sudo systemctl daemon-reload
 ```
 
+## Known Limitations & TODO
+
+### Current Limitation: Directory Name Matching Only
+
+**Issue**: The current implementation only matches directory names, not full paths. This means:
+- If you specify `-p clusterone1`, it will protect ANY file with `clusterone1` in its parent path
+- Examples of what gets protected:
+  - `/tmp/clusterone1/file.txt` ✓ (intended)
+  - `/home/user/clusterone1/file.txt` ✓ (NOT intended!)
+  - `/mnt/clusterone1/data.txt` ✓ (NOT intended!)
+
+**Why**: To avoid eBPF verifier complexity limits, we simplified the path checking logic to only compare individual directory names instead of reconstructing full paths.
+
+**TODO**: Implement proper full path matching using `bpf_d_path()` helper function (available in kernel 5.10+):
+- Accept full paths like `-p /tmp/clusterone1`
+- Match only files under that exact path prefix
+- Use BPF helper to avoid manual path reconstruction loops
+- Should eliminate verifier complexity issues while providing precise path matching
+
+**Workaround**: Use unique directory names that won't appear elsewhere on your system (e.g., `minio-cluster1-data` instead of `clusterone1`).
+
 ## License
 
 GPL-2.0
