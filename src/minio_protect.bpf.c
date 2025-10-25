@@ -27,14 +27,6 @@ struct {
 	__type(value, __u8);
 } allowed_uids SEC(".maps");
 
-/* Map: Protected path prefixes */
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_PROTECTED_PATHS);
-	__type(key, __u32);
-	__type(value, char[MAX_PATH_LEN]);
-} protected_paths SEC(".maps");
-
 /* Map: Per-UID statistics */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -85,78 +77,9 @@ static __always_inline bool should_log_allowed(void)
 	return log && *log == 1;
 }
 
-/* Simple string comparison for path prefixes (up to 32 chars to avoid verifier issues) */
-static __always_inline bool path_starts_with(const char *name, const char *prefix)
-{
-	#pragma unroll
-	for (int i = 0; i < 32; i++) {
-		if (prefix[i] == '\0')
-			return true;  /* Reached end of prefix, it's a match */
-		if (name[i] == '\0')
-			return false; /* Name ended before prefix */
-		if (name[i] != prefix[i])
-			return false; /* Mismatch */
-	}
-	return true; /* All 32 chars matched */
-}
-
-/* Check if dentry or any parent matches protected path
- * We walk up parent directories checking each one */
-static __always_inline bool is_protected_path(struct dentry *dentry)
-{
-	struct dentry *current = dentry;
-	struct dentry *parent;
-	struct qstr d_name;
-	char name_buf[32];  /* Reduced to 32 to match string comparison limit */
-
-	/* Walk up to 4 levels checking each directory name (reduced from 6) */
-	#pragma unroll
-	for (int level = 0; level < 4; level++) {
-		if (!current)
-			break;
-
-		/* Read dentry name */
-		int err = bpf_probe_read_kernel(&d_name, sizeof(d_name), &current->d_name);
-		if (err)
-			break;
-
-		/* Copy name to buffer */
-		err = bpf_probe_read_kernel_str(name_buf, sizeof(name_buf), d_name.name);
-		if (err < 0)
-			break;
-
-		/* Debug: print the directory name we're checking */
-		bpf_printk("Checking dir level %d: %s\n", level, name_buf);
-
-		/* Check this directory name against all protected prefixes (reduced from 16 to 8) */
-		#pragma unroll
-		for (int i = 0; i < 8; i++) {
-			__u32 idx = i;
-			char *prefix = bpf_map_lookup_elem(&protected_paths, &idx);
-			if (!prefix || prefix[0] == '\0')
-				break;
-
-			/* Debug: print what we're comparing */
-			bpf_printk("Comparing '%s' with prefix '%s'\n", name_buf, prefix);
-
-			/* Check if name starts with prefix */
-			if (path_starts_with(name_buf, prefix)) {
-				bpf_printk("MATCH FOUND!\n");
-				return true;
-			}
-		}
-
-		/* Move to parent */
-		err = bpf_probe_read_kernel(&parent, sizeof(parent), &current->d_parent);
-		if (err || parent == current)
-			break;
-
-		current = parent;
-	}
-
-	bpf_printk("No match found\n");
-	return false;
-}
+/* Path checking removed - Option B: Pure UID-based protection
+ * We now simply protect ALL files owned by whitelisted UIDs, regardless of path.
+ * This is much simpler, faster, and more secure. */
 
 /* Update global statistics */
 static __always_inline void update_global_stat(__u32 stat_type)
@@ -178,46 +101,48 @@ static __always_inline void update_blocked_stat(__u32 uid)
 	}
 }
 
-/* Core deletion check logic */
-static __always_inline int check_deletion_allowed(const char *op_name, struct dentry *dentry)
+/* Core deletion check logic - SIMPLIFIED UID-ONLY PROTECTION
+ * Simple rule: Only the owner (whitelisted UID) can delete their own files
+ * No path checking needed! */
+static __always_inline int check_deletion_allowed(const char *op_name, struct dentry *dentry, struct inode *inode)
 {
 	/* If protection is disabled, allow everything */
 	if (!is_protection_enabled())
 		return 0;
 
-	/* Check if this path is protected */
-	if (!is_protected_path(dentry)) {
-		/* Not a protected path, allow operation */
+	/* Get process UID and file owner UID */
+	__u32 process_uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	__u32 file_owner_uid = BPF_CORE_READ(inode, i_uid.val);
+
+	/* Check if file is owned by a protected UID */
+	__u8 *owner_protected = bpf_map_lookup_elem(&allowed_uids, &file_owner_uid);
+	if (!owner_protected || *owner_protected != 1) {
+		/* File is not owned by a protected UID - allow anyone to delete it */
 		return 0;
 	}
 
-	__u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-
-	/* Check if UID is in allowed list */
-	__u8 *allowed = bpf_map_lookup_elem(&allowed_uids, &uid);
-	if (allowed && *allowed == 1) {
-		/* Update allowed counter */
-		update_global_stat(STAT_ALLOWED_TOTAL);
-
-		/* Optionally log allowed operations */
+	/* File IS owned by a protected UID
+	 * Only allow deletion if process UID matches file owner UID */
+	if (process_uid == file_owner_uid) {
+		/* Owner deleting their own file - allow */
 		if (should_log_allowed()) {
 			char comm[16];
 			bpf_get_current_comm(&comm, sizeof(comm));
-			bpf_printk("ALLOWED %s: UID=%u comm=%s\n", op_name, uid,
-				   comm);
+			bpf_printk("ALLOWED %s: UID=%u deleting own file\n",
+				   op_name, process_uid);
 		}
-
-		return 0; /* Allow */
+		return 0;
 	}
 
-	/* Block and log */
+	/* BLOCK: Someone trying to delete a file owned by protected UID */
 	char comm[16];
 	bpf_get_current_comm(&comm, sizeof(comm));
-	bpf_printk("BLOCKED %s: UID=%u comm=%s\n", op_name, uid, comm);
+	bpf_printk("BLOCKED %s: process_UID=%u trying to delete file owned by protected_UID=%u (comm=%s)\n",
+		   op_name, process_uid, file_owner_uid, comm);
 
 	/* Update statistics */
 	update_global_stat(STAT_BLOCKED_TOTAL);
-	update_blocked_stat(uid);
+	update_blocked_stat(process_uid);
 
 	return -EPERM; /* Permission denied */
 }
@@ -230,7 +155,12 @@ int BPF_PROG(minio_protect_unlink, struct inode *dir, struct dentry *dentry,
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("unlink", dentry);
+	/* Get the inode being deleted to check its owner */
+	struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+	if (!inode)
+		return 0;
+
+	return check_deletion_allowed("unlink", dentry, inode);
 }
 
 /* LSM Hook: inode_rmdir */
@@ -241,7 +171,11 @@ int BPF_PROG(minio_protect_rmdir, struct inode *dir, struct dentry *dentry,
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("rmdir", dentry);
+	struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+	if (!inode)
+		return 0;
+
+	return check_deletion_allowed("rmdir", dentry, inode);
 }
 
 /* LSM Hook: inode_rename */
@@ -253,7 +187,11 @@ int BPF_PROG(minio_protect_rename, struct inode *old_dir,
 	if (ret != 0)
 		return ret;
 
-	return check_deletion_allowed("rename", old_dentry);
+	struct inode *inode = BPF_CORE_READ(old_dentry, d_inode);
+	if (!inode)
+		return 0;
+
+	return check_deletion_allowed("rename", old_dentry, inode);
 }
 
 char LICENSE[] SEC("license") = "GPL";
