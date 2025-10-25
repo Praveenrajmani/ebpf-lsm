@@ -1,171 +1,265 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# MinIO Protection Deployment Script
+# MinIO Protection - Deployment Script
+#
+# This script automates the deployment of MinIO eBPF LSM protection:
+# - Checks kernel requirements
+# - Installs dependencies
+# - Builds the eBPF program
+# - Installs and configures systemd service
 
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="${SCRIPT_DIR}/.output/minio_protect"
-INSTALL_PATH="/usr/local/bin/minio_protect"
-SERVICE_FILE="${SCRIPT_DIR}/minio-protect.service"
-SERVICE_INSTALL_PATH="/etc/systemd/system/minio-protect.service"
+set -e  # Exit on any error
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging functions
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# Configuration
+PROTECTED_UID=""
+SERVICE_NAME="minio-protect"
+INSTALL_PATH="/usr/local/bin/minio_protect"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# Print functions
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-log_error() {
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+print_header() {
+    echo -e "\n${BLUE}========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================${NC}\n"
+}
+
+# Print usage
+usage() {
+    cat << EOF
+MinIO Protection - Deployment Script
+
+Usage: $0 -u <UID> [options]
+
+Required:
+  -u, --uid UID          UID to protect (MinIO user UID)
+
+Options:
+  -h, --help             Show this help message
+  --uninstall            Uninstall the protection service
+  --no-start             Don't start the service after installation
+
+Examples:
+  # Deploy and protect UID 1000
+  sudo $0 -u 1000
+
+  # Deploy without starting service
+  sudo $0 -u 1000 --no-start
+
+  # Uninstall
+  sudo $0 --uninstall
+
+EOF
+    exit 1
 }
 
 # Check if running as root
 check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "This script must be run as root"
+    if [[ $EUID -ne 0 ]]; then
+        print_error "This script must be run as root (use sudo)"
         exit 1
     fi
 }
 
 # Check kernel requirements
 check_kernel() {
-    log_info "Checking kernel requirements..."
+    print_header "Checking Kernel Requirements"
 
-    local kernel_version=$(uname -r)
-    local major=$(echo "$kernel_version" | cut -d. -f1)
-    local minor=$(echo "$kernel_version" | cut -d. -f2)
+    # Check kernel version (need 5.7+)
+    local kernel_version=$(uname -r | cut -d. -f1,2)
+    local major=$(echo $kernel_version | cut -d. -f1)
+    local minor=$(echo $kernel_version | cut -d. -f2)
 
-    log_info "Kernel version: $kernel_version"
+    print_info "Kernel version: $(uname -r)"
 
-    # Check if kernel is 5.7+
     if [ "$major" -lt 5 ] || ([ "$major" -eq 5 ] && [ "$minor" -lt 7 ]); then
-        log_error "Kernel 5.7+ required for eBPF LSM support"
+        print_error "Kernel 5.7+ required for eBPF LSM support (current: $(uname -r))"
+        exit 1
+    fi
+    print_success "Kernel version is sufficient"
+
+    # Check if BPF LSM is enabled
+    if ! grep -q "bpf" /sys/kernel/security/lsm 2>/dev/null; then
+        print_error "BPF LSM not enabled in kernel"
+        print_info "Add 'lsm=...,bpf' to kernel boot parameters"
+        exit 1
+    fi
+    print_success "BPF LSM is enabled"
+
+    # Check BTF support
+    if [ ! -f /sys/kernel/btf/vmlinux ]; then
+        print_error "BTF (BPF Type Format) not available"
+        print_info "Rebuild kernel with CONFIG_DEBUG_INFO_BTF=y"
+        exit 1
+    fi
+    print_success "BTF support available"
+
+    # Check debugfs (for trace_pipe)
+    if [ ! -d /sys/kernel/debug/tracing ]; then
+        print_warning "debugfs not mounted, mounting now..."
+        mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+    fi
+    print_success "All kernel requirements met"
+}
+
+# Install dependencies
+install_dependencies() {
+    print_header "Installing Dependencies"
+
+    # Detect package manager
+    if command -v dnf &> /dev/null; then
+        PKG_MGR="dnf"
+    elif command -v yum &> /dev/null; then
+        PKG_MGR="yum"
+    elif command -v apt-get &> /dev/null; then
+        PKG_MGR="apt-get"
+    else
+        print_error "Unsupported package manager"
         exit 1
     fi
 
-    # Check if LSM BPF is enabled
-    if [ -f /sys/kernel/security/lsm ]; then
-        local lsm_list=$(cat /sys/kernel/security/lsm)
-        log_info "Active LSMs: $lsm_list"
+    print_info "Using package manager: $PKG_MGR"
 
-        if echo "$lsm_list" | grep -q "bpf"; then
-            log_info "✓ LSM BPF is enabled"
-        else
-            log_error "✗ LSM BPF is NOT enabled"
-            log_error ""
-            log_error "To enable LSM BPF:"
-            log_error "  1. Edit /etc/default/grub"
-            log_error "  2. Add 'lsm=bpf' to GRUB_CMDLINE_LINUX"
-            log_error "     Example: GRUB_CMDLINE_LINUX=\"... lsm=bpf\""
-            log_error "  3. Rebuild grub config:"
-            log_error "     grub2-mkconfig -o /boot/grub2/grub.cfg"
-            log_error "  4. Reboot"
-            exit 1
-        fi
-    else
-        log_warn "/sys/kernel/security/lsm not found"
+    # Required packages
+    local packages=(
+        "clang"
+        "llvm"
+        "make"
+        "gcc"
+        "bpftool"
+        "libbpf-devel"
+        "elfutils-libelf-devel"
+        "zlib-devel"
+        "kernel-devel"
+    )
+
+    # Adjust package names for Debian/Ubuntu
+    if [ "$PKG_MGR" = "apt-get" ]; then
+        packages=(
+            "clang"
+            "llvm"
+            "make"
+            "gcc"
+            "linux-tools-common"
+            "linux-tools-$(uname -r)"
+            "libbpf-dev"
+            "libelf-dev"
+            "zlib1g-dev"
+            "linux-headers-$(uname -r)"
+        )
     fi
 
-    # Check BTF support
-    if [ -f /sys/kernel/btf/vmlinux ]; then
-        log_info "✓ BTF support available"
-    else
-        log_warn "✗ BTF support not found (may cause issues)"
-    fi
+    print_info "Installing required packages..."
+
+    case $PKG_MGR in
+        dnf|yum)
+            $PKG_MGR install -y "${packages[@]}"
+            ;;
+        apt-get)
+            apt-get update
+            apt-get install -y "${packages[@]}"
+            ;;
+    esac
+
+    print_success "Dependencies installed"
 }
 
 # Build the program
 build_program() {
-    log_info "Building minio_protect..."
+    print_header "Building MinIO Protection"
 
-    cd "$SCRIPT_DIR"
-    make clean
-    make
-
-    if [ ! -f "$BINARY" ]; then
-        log_error "Build failed: $BINARY not found"
+    # Check if Makefile exists
+    if [ ! -f Makefile ]; then
+        print_error "Makefile not found. Are you in the correct directory?"
         exit 1
     fi
 
-    log_info "✓ Build successful"
+    # Run make check-kernel first
+    print_info "Running kernel checks..."
+    if ! make check-kernel; then
+        print_error "Kernel check failed"
+        exit 1
+    fi
+
+    # Clean previous builds
+    print_info "Cleaning previous builds..."
+    make clean
+
+    # Build
+    print_info "Building eBPF program..."
+    if ! make; then
+        print_error "Build failed"
+        exit 1
+    fi
+
+    # Verify binary exists
+    if [ ! -f .output/minio_protect ]; then
+        print_error "Binary not found after build"
+        exit 1
+    fi
+
+    print_success "Build completed successfully"
 }
 
 # Install the binary
 install_binary() {
-    log_info "Installing binary to $INSTALL_PATH..."
+    print_header "Installing Binary"
 
-    install -m 0755 "$BINARY" "$INSTALL_PATH"
+    print_info "Installing to $INSTALL_PATH"
+    cp .output/minio_protect "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
 
-    log_info "✓ Binary installed"
+    print_success "Binary installed"
 }
 
-# Detect MinIO UID
-detect_minio_uid() {
-    local minio_uid=""
+# Create systemd service
+create_service() {
+    print_header "Creating Systemd Service"
 
-    # Try to find minio-user user
-    if id minio-user &>/dev/null; then
-        minio_uid=$(id -u minio-user)
-        log_info "Found minio-user with UID: $minio_uid"
-    # Try to find minio user
-    elif id minio &>/dev/null; then
-        minio_uid=$(id -u minio)
-        log_info "Found minio with UID: $minio_uid"
-    else
-        log_warn "Could not auto-detect MinIO user"
-        read -p "Enter MinIO UID (or press Enter to use 1000): " minio_uid
-        minio_uid=${minio_uid:-1000}
+    if [ -z "$PROTECTED_UID" ]; then
+        print_error "Protected UID not specified"
+        exit 1
     fi
 
-    echo "$minio_uid"
-}
+    print_info "Creating service file: $SERVICE_PATH"
 
-# Install systemd service
-install_service() {
-    local minio_uid=$1
-
-    log_info "Installing systemd service..."
-
-    # Create service file with correct UID
-    cat > "$SERVICE_INSTALL_PATH" <<EOF
+    cat > "$SERVICE_PATH" << EOF
 [Unit]
-Description=MinIO Protection eBPF LSM Service
-Documentation=https://github.com/miniohq/ebpf-lsm
+Description=MinIO eBPF LSM Protection
+Documentation=https://github.com/minio/ebpf-lsm
 After=network.target
-Wants=network.target
 
 [Service]
 Type=simple
-Restart=on-failure
-RestartSec=5s
+ExecStart=$INSTALL_PATH -u $PROTECTED_UID -s 300
+Restart=always
+RestartSec=10
 
-# Run as root (required for eBPF)
-User=root
-Group=root
-
-# Binary location (auto-configured by deploy.sh)
-ExecStart=$INSTALL_PATH -u $minio_uid -s 300
-
-# Security hardening
-NoNewPrivileges=false
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/sys/fs/bpf
-
-# Resource limits
-LimitNOFILE=65536
-LimitMEMLOCK=infinity
+# Security settings
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON
 
 # Logging
 StandardOutput=journal
@@ -176,112 +270,167 @@ SyslogIdentifier=minio-protect
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd
-    systemctl daemon-reload
-
-    log_info "✓ Service installed"
+    print_success "Service file created"
+    print_info "Protected UID: $PROTECTED_UID"
 }
 
-# Start and enable service
+# Enable and start service
 enable_service() {
-    log_info "Enabling and starting minio-protect.service..."
+    print_header "Enabling Service"
 
-    systemctl enable minio-protect.service
-    systemctl start minio-protect.service
+    print_info "Reloading systemd daemon..."
+    systemctl daemon-reload
 
-    sleep 2
+    print_info "Enabling service..."
+    systemctl enable "$SERVICE_NAME"
 
-    # Check status
-    if systemctl is-active --quiet minio-protect.service; then
-        log_info "✓ Service is running"
+    if [ "$NO_START" != "true" ]; then
+        print_info "Starting service..."
+        systemctl start "$SERVICE_NAME"
+
+        # Wait a moment for service to start
+        sleep 2
+
+        # Check status
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            print_success "Service started successfully"
+            print_info "Check status: sudo systemctl status $SERVICE_NAME"
+            print_info "View logs: sudo journalctl -u $SERVICE_NAME -f"
+            print_info "Monitor blocks: sudo cat /sys/kernel/debug/tracing/trace_pipe | grep minio_protect"
+        else
+            print_error "Service failed to start"
+            print_info "Check logs: sudo journalctl -u $SERVICE_NAME -xe"
+            exit 1
+        fi
     else
-        log_error "Service failed to start"
-        log_error "Check logs: journalctl -u minio-protect.service -n 50"
-        exit 1
+        print_info "Service enabled but not started (--no-start specified)"
+        print_info "Start manually: sudo systemctl start $SERVICE_NAME"
     fi
 }
 
-# Show status
-show_status() {
-    log_info ""
-    log_info "==================================="
-    log_info "MinIO Protection Status"
-    log_info "==================================="
-    systemctl status minio-protect.service --no-pager || true
-    log_info ""
-    log_info "Recent logs:"
-    journalctl -u minio-protect.service -n 10 --no-pager || true
+# Uninstall
+uninstall() {
+    print_header "Uninstalling MinIO Protection"
+
+    print_info "Stopping service..."
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+
+    print_info "Disabling service..."
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+
+    print_info "Removing service file..."
+    rm -f "$SERVICE_PATH"
+
+    print_info "Removing binary..."
+    rm -f "$INSTALL_PATH"
+
+    print_info "Reloading systemd daemon..."
+    systemctl daemon-reload
+
+    print_success "Uninstallation complete"
+    exit 0
 }
 
-# Main deployment
-main() {
-    log_info "==================================="
-    log_info "MinIO Protection Deployment"
-    log_info "==================================="
-    log_info ""
+# Print deployment summary
+print_summary() {
+    print_header "Deployment Summary"
 
+    cat << EOF
+${GREEN}MinIO Protection successfully deployed!${NC}
+
+Protected UID: ${YELLOW}$PROTECTED_UID${NC}
+Service Name: $SERVICE_NAME
+Binary Path: $INSTALL_PATH
+
+${BLUE}Quick Commands:${NC}
+  Check status:    sudo systemctl status $SERVICE_NAME
+  View logs:       sudo journalctl -u $SERVICE_NAME -f
+  Monitor blocks:  sudo cat /sys/kernel/debug/tracing/trace_pipe | grep minio_protect
+  Stop service:    sudo systemctl stop $SERVICE_NAME
+  Start service:   sudo systemctl start $SERVICE_NAME
+  Restart service: sudo systemctl restart $SERVICE_NAME
+
+${BLUE}How It Works:${NC}
+  • Files owned by UID $PROTECTED_UID can only be deleted by UID $PROTECTED_UID
+  • Any other UID attempting to delete these files will be blocked
+  • Only BLOCKED operations are logged (use -v in service file for verbose mode)
+
+${BLUE}Test Protection:${NC}
+  # Create a test file owned by protected UID
+  sudo -u '#$PROTECTED_UID' touch /tmp/test-protected.txt
+
+  # Try to delete as root (should be BLOCKED)
+  sudo rm /tmp/test-protected.txt
+
+  # Check logs for BLOCKED message
+  sudo cat /sys/kernel/debug/tracing/trace_pipe | grep -i blocked
+
+EOF
+}
+
+# Main deployment flow
+main() {
+    local UNINSTALL=false
+    NO_START=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -u|--uid)
+                PROTECTED_UID="$2"
+                shift 2
+                ;;
+            --uninstall)
+                UNINSTALL=true
+                shift
+                ;;
+            --no-start)
+                NO_START=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                usage
+                ;;
+        esac
+    done
+
+    # Check if root
     check_root
+
+    # Handle uninstall
+    if [ "$UNINSTALL" = true ]; then
+        uninstall
+    fi
+
+    # Validate UID is provided
+    if [ -z "$PROTECTED_UID" ]; then
+        print_error "Protected UID not specified"
+        usage
+    fi
+
+    # Validate UID is a number
+    if ! [[ "$PROTECTED_UID" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid UID: $PROTECTED_UID (must be a number)"
+        exit 1
+    fi
+
+    print_header "MinIO Protection Deployment"
+    print_info "Deploying protection for UID: $PROTECTED_UID"
+
+    # Run deployment steps
     check_kernel
+    install_dependencies
     build_program
     install_binary
-
-    local minio_uid=$(detect_minio_uid)
-
-    install_service "$minio_uid"
+    create_service
     enable_service
-    show_status
 
-    log_info ""
-    log_info "==================================="
-    log_info "Deployment Complete!"
-    log_info "==================================="
-    log_info ""
-    log_info "MinIO Protection is now active and will:"
-    log_info "  ✓ Allow UID $minio_uid to delete files"
-    log_info "  ✗ Block all other users (including root)"
-    log_info ""
-    log_info "Useful commands:"
-    log_info "  systemctl status minio-protect   - Check status"
-    log_info "  journalctl -u minio-protect -f   - Follow logs"
-    log_info "  systemctl stop minio-protect     - Stop protection"
-    log_info "  systemctl start minio-protect    - Start protection"
-    log_info "  dmesg | grep BLOCKED             - See blocked attempts"
-    log_info ""
+    print_summary
 }
 
-# Handle script arguments
-case "${1:-}" in
-    --uninstall)
-        check_root
-        log_info "Uninstalling MinIO Protection..."
-        systemctl stop minio-protect.service 2>/dev/null || true
-        systemctl disable minio-protect.service 2>/dev/null || true
-        rm -f "$SERVICE_INSTALL_PATH"
-        rm -f "$INSTALL_PATH"
-        systemctl daemon-reload
-        log_info "✓ Uninstallation complete"
-        ;;
-    --status)
-        show_status
-        ;;
-    --help)
-        echo "MinIO Protection Deployment Script"
-        echo ""
-        echo "Usage: $0 [option]"
-        echo ""
-        echo "Options:"
-        echo "  (none)       Deploy and start MinIO Protection"
-        echo "  --uninstall  Remove MinIO Protection"
-        echo "  --status     Show current status"
-        echo "  --help       Show this help message"
-        echo ""
-        ;;
-    "")
-        main
-        ;;
-    *)
-        log_error "Unknown option: $1"
-        log_error "Use --help for usage information"
-        exit 1
-        ;;
-esac
+# Run main function
+main "$@"

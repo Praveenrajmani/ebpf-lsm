@@ -4,6 +4,34 @@
 
 Prevents accidental deletion of MinIO files by unauthorized users using Linux Security Module (LSM) BPF hooks. Simple rule: **only the file owner can delete their own files**.
 
+## Quickstart
+
+Deploy MinIO protection in one command:
+
+```bash
+# Get MinIO user UID
+id -u minio
+
+# Deploy protection (replace 1000 with your MinIO UID)
+sudo ./deploy.sh -u 1000
+```
+
+That's it! The script will:
+- ✓ Check kernel requirements (LSM BPF, BTF support)
+- ✓ Install dependencies (clang, bpftool, libbpf, etc.)
+- ✓ Build the eBPF program
+- ✓ Install as systemd service
+- ✓ Start protection immediately
+
+Monitor protection in action:
+```bash
+# View blocked operations in real-time
+sudo cat /sys/kernel/debug/tracing/trace_pipe | grep minio_protect
+
+# Check service status
+sudo systemctl status minio-protect
+```
+
 ## How It Works
 
 Uses LSM BPF hooks to intercept file deletion operations (`unlink`, `rmdir`, `rename`) at the kernel level:
@@ -42,6 +70,10 @@ sudo dnf install clang bpftool libbpf-devel kernel-devel
 ```
 
 ## Setup Guide
+
+**For automated deployment, use the [Quickstart](#quickstart) section above with `deploy.sh`**
+
+For manual setup, follow these steps:
 
 ### Step 1: Check Kernel Requirements
 
@@ -225,6 +257,12 @@ cat /sys/fs/bpf/minio_protect_config/enable
 
 ## Uninstall
 
+Using deploy script (recommended):
+```bash
+sudo ./deploy.sh --uninstall
+```
+
+Or manually:
 ```bash
 sudo systemctl stop minio-protect
 sudo systemctl disable minio-protect
